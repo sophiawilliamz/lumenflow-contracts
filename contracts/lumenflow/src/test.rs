@@ -4535,3 +4535,204 @@ fn test_get_token_whitelist() {
     assert_eq!(list_after.len(), 1);
     assert!(list_after.contains(&token));
 }
+
+// ── State Rollback and Error Handling Tests (Issue #346) ──────────────────────
+
+#[test]
+fn test_failed_refund_does_not_update_payment_state() {
+    // Verifies that a rejected refund execution does not update the payment state.
+    // This test ensures proper transaction semantics - either all state changes commit
+    // or the transaction fails atomically.
+    let (env, client, _admin, merchant, payer, token) = setup_payment_env();
+    make_payment(&env, &client, &merchant, &payer, &token, "ORDER_ERR1", 1_000);
+
+    // Record initial state
+    let initial_payment = client.get_payment_by_id(&payer, &str(&env, "ORDER_ERR1"));
+    assert_eq!(initial_payment.refunded_amount, 0);
+    assert!(matches!(
+        initial_payment.status,
+        crate::types::PaymentStatus::Completed
+    ));
+
+    // Attempt to execute a refund that is still pending (not approved)
+    client.initiate_refund(
+        &payer,
+        &str(&env, "REFUND_ERR1"),
+        &str(&env, "ORDER_ERR1"),
+        &200,
+        &str(&env, "test"),
+    );
+    let result = client.try_execute_refund(&str(&env, "REFUND_ERR1"));
+    assert!(result.is_err());
+
+    // Verify payment state remains unchanged
+    let payment_after_failure = client.get_payment_by_id(&payer, &str(&env, "ORDER_ERR1"));
+    assert_eq!(payment_after_failure.refunded_amount, 0, "Refunded amount changed on failed refund");
+    assert!(
+        matches!(payment_after_failure.status, crate::types::PaymentStatus::Completed),
+        "Payment status changed on failed refund"
+    );
+    assert_eq!(
+        payment_after_failure.refunded_amount, initial_payment.refunded_amount,
+        "Payment state was modified despite failed refund"
+    );
+}
+
+#[test]
+fn test_failed_refund_does_not_update_merchant_stats() {
+    // Verifies that failed refund operations do not update merchant statistics.
+    let (env, client, _admin, merchant, payer, token) = setup_payment_env();
+    make_payment(&env, &client, &merchant, &payer, &token, "ORDER_STATS1", 1_000);
+
+    // Record initial stats
+    let initial_stats = client.get_merchant_stats(&merchant);
+    let initial_refund_count = initial_stats.total_refunds;
+    let initial_refund_volume = initial_stats.total_refund_volume;
+
+    // Attempt to execute a pending (unapproved) refund
+    client.initiate_refund(
+        &payer,
+        &str(&env, "REFUND_STATS1"),
+        &str(&env, "ORDER_STATS1"),
+        &300,
+        &str(&env, "test"),
+    );
+    let _ = client.try_execute_refund(&str(&env, "REFUND_STATS1"));
+
+    // Verify merchant stats remain unchanged
+    let stats_after_failure = client.get_merchant_stats(&merchant);
+    assert_eq!(
+        stats_after_failure.total_refunds, initial_refund_count,
+        "Merchant refund count changed on failed execution"
+    );
+    assert_eq!(
+        stats_after_failure.total_refund_volume, initial_refund_volume,
+        "Merchant refund volume changed on failed execution"
+    );
+}
+
+#[test]
+fn test_failed_refund_does_not_update_global_stats() {
+    // Verifies that failed refund operations do not affect global contract statistics.
+    let (env, client, _admin, merchant, payer, token) = setup_payment_env();
+    make_payment(&env, &client, &merchant, &payer, &token, "ORDER_GLOBAL1", 1_000);
+
+    // Record initial global stats
+    let initial_stats = client.get_global_stats();
+    let initial_refund_count = initial_stats.total_refunds;
+    let initial_refund_volume = initial_stats.total_refund_volume;
+
+    // Attempt failed refund
+    client.initiate_refund(
+        &payer,
+        &str(&env, "REFUND_GLOBAL1"),
+        &str(&env, "ORDER_GLOBAL1"),
+        &250,
+        &str(&env, "test"),
+    );
+    let _ = client.try_execute_refund(&str(&env, "REFUND_GLOBAL1"));
+
+    // Verify global stats unchanged
+    let stats_after_failure = client.get_global_stats();
+    assert_eq!(
+        stats_after_failure.total_refunds, initial_refund_count,
+        "Global refund count changed on failed execution"
+    );
+    assert_eq!(
+        stats_after_failure.total_refund_volume, initial_refund_volume,
+        "Global refund volume changed on failed execution"
+    );
+}
+
+#[test]
+fn test_failed_merchant_registration_leaves_no_state() {
+    // Verifies that attempting to register a duplicate merchant does not create partial state.
+    let (env, client, _admin, merchant, _payer, _token) = setup_payment_env();
+
+    // First registration succeeds
+    client.register_merchant(
+        &merchant,
+        &str(&env, "Store A"),
+        &str(&env, "Description"),
+        &str(&env, "contact@store.com"),
+        &crate::types::MerchantCategory::Retail,
+    );
+
+    let first = client.get_merchant(&merchant);
+    assert_eq!(first.name, str(&env, "Store A"));
+
+    // Second registration with same address fails
+    let result = client.try_register_merchant(
+        &merchant,
+        &str(&env, "Store B"),
+        &str(&env, "Different description"),
+        &str(&env, "other@store.com"),
+        &crate::types::MerchantCategory::Services,
+    );
+    assert_eq!(result, Err(Ok(PaymentError::MerchantAlreadyRegistered)));
+
+    // Verify original merchant data unchanged
+    let after_failure = client.get_merchant(&merchant);
+    assert_eq!(after_failure.name, str(&env, "Store A"), "Merchant name changed after failed duplicate registration");
+    assert_eq!(
+        after_failure.contact, str(&env, "contact@store.com"),
+        "Merchant contact changed after failed duplicate registration"
+    );
+}
+
+#[test]
+fn test_rejected_refund_approval_leaves_refund_pending() {
+    // Verifies that state is not partially updated when a refund rejection succeeds.
+    // This documents expected behavior: rejection changes state, but atomically.
+    let (env, client, _admin, merchant, payer, token) = setup_payment_env();
+    make_payment(&env, &client, &merchant, &payer, &token, "ORDER_REJ1", 800);
+
+    client.initiate_refund(
+        &payer,
+        &str(&env, "REFUND_REJ1"),
+        &str(&env, "ORDER_REJ1"),
+        &200,
+        &str(&env, "test"),
+    );
+
+    // Record refund state
+    let refund_before = client.get_refund(&str(&env, "REFUND_REJ1"));
+    assert!(matches!(
+        refund_before.status,
+        crate::types::RefundStatus::Pending
+    ));
+
+    // Reject the refund
+    client.reject_refund(&merchant, &str(&env, "REFUND_REJ1"));
+
+    // Verify refund state changed as expected (this is a successful operation)
+    let refund_after = client.get_refund(&str(&env, "REFUND_REJ1"));
+    assert!(matches!(
+        refund_after.status,
+        crate::types::RefundStatus::Rejected
+    ));
+
+    // Verify payment was NOT updated
+    let payment = client.get_payment_by_id(&payer, &str(&env, "ORDER_REJ1"));
+    assert_eq!(payment.refunded_amount, 0, "Refunded amount should be 0 after rejection");
+}
+
+#[test]
+fn test_invalid_payment_lookup_does_not_corrupt_state() {
+    // Verifies that attempting to look up a non-existent payment doesn't leave the
+    // contract in an inconsistent state.
+    let (env, client, _admin, merchant, payer, token) = setup_payment_env();
+    make_payment(&env, &client, &merchant, &payer, &token, "ORDER_VALID", 500);
+
+    // Attempt to get a non-existent payment
+    let result = client.try_get_payment_by_id(&payer, &str(&env, "ORDER_NONEXISTENT"));
+    assert!(result.is_err());
+
+    // Verify that the valid payment is still accessible and unchanged
+    let valid_payment = client.get_payment_by_id(&payer, &str(&env, "ORDER_VALID"));
+    assert_eq!(valid_payment.amount, 500);
+    assert!(matches!(
+        valid_payment.status,
+        crate::types::PaymentStatus::Completed
+    ));
+}
